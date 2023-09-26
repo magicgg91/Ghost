@@ -134,13 +134,7 @@ module.exports = {
             const html = frame.data.pages[0].html;
 
             if (frame.options.source === 'html' && !_.isEmpty(html)) {
-                frame.data.pages[0].mobiledoc = JSON.stringify(mobiledoc.htmlToMobiledocConverter(html));
-
-                // normally we don't allow both mobiledoc+lexical but the model layer will remove lexical
-                // if mobiledoc is already present to avoid migrating formats outside of an explicit conversion
-                if (labs.isSet('lexicalEditor')) {
-                    frame.data.pages[0].lexical = JSON.stringify(lexical.htmlToLexicalConverter(html));
-                }
+                frame.data.pages[0].lexical = JSON.stringify(lexical.htmlToLexicalConverter(html));
             }
         }
 

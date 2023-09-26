@@ -37,10 +37,6 @@ export default class EditRoute extends AuthenticatedRoute {
         const records = await this.store.query(modelName, query);
         const post = records.firstObject;
 
-        if (post.lexical) {
-            return this.router.transitionTo('lexical-editor.edit', post);
-        }
-
         return post;
     }
 

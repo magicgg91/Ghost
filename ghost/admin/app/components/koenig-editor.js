@@ -119,7 +119,7 @@ const KoenigComposer = (props) => {
     return <_KoenigComposer {...props} />;
 };
 
-const KoenigEditor = (props) => {
+const KoenigEditorContainer = (props) => {
     const {KoenigEditor: _KoenigEditor} = editorResource.read();
     return <_KoenigEditor {...props} />;
 };
@@ -129,7 +129,7 @@ const WordCountPlugin = (props) => {
     return <_WordCountPlugin {...props} />;
 };
 
-export default class KoenigLexicalEditor extends Component {
+export default class KoenigEditor extends Component {
     @service ajax;
     @service feature;
     @service ghostPaths;
@@ -160,7 +160,7 @@ export default class KoenigLexicalEditor extends Component {
     get pinturaConfig() {
         const jsUrl = this.getImageEditorJSUrl();
         const cssUrl = this.getImageEditorCSSUrl();
-        if (!this.feature.lexicalEditor || !jsUrl || !cssUrl) {
+        if (!jsUrl || !cssUrl) {
             return null;
         }
         return {
@@ -571,7 +571,7 @@ export default class KoenigLexicalEditor extends Component {
                             onError={this.onError}
                             darkMode={this.feature.nightShift}
                         >
-                            <KoenigEditor
+                            <KoenigEditorContainer
                                 cursorDidExitAtTop={this.args.cursorDidExitAtTop}
                                 placeholderText={this.args.placeholder}
                                 darkMode={this.feature.nightShift}

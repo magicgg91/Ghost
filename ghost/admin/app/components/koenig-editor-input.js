@@ -94,7 +94,7 @@ const HtmlOutputPlugin = (props) => {
     return <_HtmlOutputPlugin {...props} />;
 };
 
-export default class KoenigLexicalEditorInput extends Component {
+export default class KoenigEditorInput extends Component {
     @service ajax;
     @service feature;
     @service session;

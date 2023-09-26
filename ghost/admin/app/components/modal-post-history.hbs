@@ -17,7 +17,7 @@
                     </div>
                 </div>
                 <div class="gh-editor-title">{{this.currentTitle}}</div>
-                <KoenigLexicalEditor @lexical={{this.selectedRevision.lexical}} @cardConfig={{this.cardConfig}} @registerAPI={{action "registerSelectedEditorApi"}}/>
+                <KoenigEditor @lexical={{this.selectedRevision.lexical}} @cardConfig={{this.cardConfig}} @registerAPI={{action "registerSelectedEditorApi"}}/>
             </div>
         </div>
     </div>

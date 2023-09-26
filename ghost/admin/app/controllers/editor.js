@@ -1,3 +1,4 @@
+import * as Sentry from '@sentry/ember';
 import ConfirmEditorLeaveModal from '../components/modals/editor/confirm-leave';
 import Controller, {inject as controller} from '@ember/controller';
 import DeletePostModal from '../components/modals/delete-post';
@@ -23,6 +24,7 @@ import {isBlank} from '@ember/utils';
 import {isArray as isEmberArray} from '@ember/array';
 import {isHostLimitError, isServerUnreachableError, isVersionMismatchError} from 'ghost-admin/services/ajax';
 import {isInvalidError} from 'ember-ajax/errors';
+import {mobiledocToLexical} from '@tryghost/kg-converters';
 import {inject as service} from '@ember/service';
 
 const DEFAULT_TITLE = '(Untitled)';
@@ -32,10 +34,12 @@ const DUPLICATED_POST_TITLE_SUFFIX = '(Copy)';
 const AUTOSAVE_TIMEOUT = 3000;
 // time in ms to force a save if the user is continuously typing
 const TIMEDSAVE_TIMEOUT = 60000;
+// time in ms to force a save even if the post is already saved so we trigger a new revision on the server
+const REVISIONSAVE_TIMEOUT = 1000 * 60 * 10; // 10 minutes
 
 // this array will hold properties we need to watch for this.hasDirtyAttributes
 let watchedProps = [
-    'post.scratch',
+    'post.lexicalScratch',
     'post.titleScratch',
     'post.hasDirtyAttributes',
     'post.tags.[]',
@@ -124,7 +128,7 @@ export default class EditorController extends Controller {
     fromAnalytics = false;
 
     // koenig related properties
-    wordcount = null;
+    wordCount = 0;
 
     /* private properties ----------------------------------------------------*/
 
@@ -170,12 +174,23 @@ export default class EditorController extends Controller {
         return this.store.peekAll('snippet');
     }
 
-    @computed('_snippets.@each.{name,isNew}')
+    @computed('_snippets.@each.{name,isNew,mobiledoc,lexical}')
     get snippets() {
-        return this._snippets
+        const snippets = this._snippets
             .reject(snippet => snippet.get('isNew'))
-            .reject(snippet => ['{}', '"{}"'].includes(JSON.stringify(snippet.mobiledoc)))
-            .sort((a, b) => a.name.localeCompare(b.name));
+            .sort((a, b) => a.name.localeCompare(b.name))
+            .filter(item => item.lexical !== null);
+
+        return snippets.map((item) => {
+            item.value = JSON.stringify(item.lexical);
+
+            return item;
+        });
+    }
+
+    @computed
+    get collections() {
+        return this.store.peekAll('collection');
     }
 
     @computed('session.user.{isAdmin,isEditor}')
@@ -187,12 +202,13 @@ export default class EditorController extends Controller {
         return false;
     }
 
-    @computed('_autosaveTask.isRunning', '_timedSaveTask.isRunning')
+    @computed('_autosaveTask.isRunning', '_timedSaveTask.isRunning', '_revisionSaveTask.isRunning')
     get _autosaveRunning() {
         let autosave = this.get('_autosaveTask.isRunning');
         let timedsave = this.get('_timedSaveTask.isRunning');
+        let revisionsave = this.get('_revisionSaveTask.isRunning');
 
-        return autosave || timedsave;
+        return autosave || timedsave || revisionsave;
     }
 
     @computed('post.isDraft')
@@ -201,13 +217,15 @@ export default class EditorController extends Controller {
     }
 
     @action
-    updateScratch(mobiledoc) {
-        this.set('post.scratch', mobiledoc);
+    updateScratch(lexical) {
+        this.set('post.lexicalScratch', JSON.stringify(lexical));
 
         // save 3 seconds after last edit
         this._autosaveTask.perform();
         // force save at 60 seconds
         this._timedSaveTask.perform();
+        // force save at 10 minutes to trigger revision
+        this._revisionSaveTask.perform();
     }
 
     @action
@@ -242,6 +260,7 @@ export default class EditorController extends Controller {
     cancelAutosave() {
         this._autosaveTask.cancelAll();
         this._timedSaveTask.cancelAll();
+        this._revisionSaveTask.cancelAll();
     }
 
     // called by the "are you sure?" modal
@@ -285,14 +304,15 @@ export default class EditorController extends Controller {
         // - empty cards may be left in draft posts due to autosave occuring
         //   whilst an empty card is present then the user closing the browser
         //   or refreshing the page
-        if (this.post.isDraft) {
-            this._koenig.cleanup();
-        }
+        // TODO: not yet implemented in react editor
+        // if (this.post.isDraft) {
+        //     this._koenig.cleanup();
+        // }
     }
 
     @action
-    updateWordCount(counts) {
-        this.set('wordCount', counts);
+    updateWordCount(count) {
+        this.set('wordCount', count);
     }
 
     @action
@@ -302,6 +322,11 @@ export default class EditorController extends Controller {
         if (this.post.isDraft) {
             this.autosaveTask.perform();
         }
+    }
+
+    @action
+    registerEditorAPI(API) {
+        this.editorAPI = API;
     }
 
     @action
@@ -344,8 +369,10 @@ export default class EditorController extends Controller {
     }
 
     @action
-    saveSnippet(snippet) {
-        let snippetRecord = this.store.createRecord('snippet', snippet);
+    saveNewSnippet(snippet) {
+        const snippetData = {name: snippet.name, lexical: JSON.parse(snippet.value), mobiledoc: {}};
+        const snippetRecord = this.store.createRecord('snippet', snippetData);
+
         return snippetRecord.save().then(() => {
             this.notifications.closeAlerts('snippet.save');
             this.notifications.showNotification(
@@ -363,6 +390,18 @@ export default class EditorController extends Controller {
             snippetRecord.rollbackAttributes();
             throw error;
         });
+    }
+
+    @action
+    async createSnippet(data) {
+        const snippetNameLC = data.name.trim().toLowerCase();
+        const existingSnippet = this.snippets.find(snippet => snippet.name.toLowerCase() === snippetNameLC);
+
+        if (existingSnippet) {
+            await this.confirmUpdateSnippet(existingSnippet, {lexical: JSON.parse(data.value)});
+        } else {
+            await this.saveNewSnippet(data);
+        }
     }
 
     @action
@@ -384,11 +423,12 @@ export default class EditorController extends Controller {
 
     // separate task for autosave so that it doesn't override a manual save
     @dropTask
-    *autosaveTask() {
+    *autosaveTask(options) {
         if (!this.get('saveTask.isRunning')) {
             return yield this.saveTask.perform({
                 silent: true,
-                backgroundSave: true
+                backgroundSave: true,
+                ...options
             });
         }
     }
@@ -400,10 +440,11 @@ export default class EditorController extends Controller {
         let prevStatus = this.get('post.status');
         let isNew = this.get('post.isNew');
         let status;
+        const adapterOptions = {};
 
         this.cancelAutosave();
 
-        if (options.backgroundSave && !this.hasDirtyAttributes) {
+        if (options.backgroundSave && !this.hasDirtyAttributes && !options.leavingEditor && !options.saveRevision) {
             return;
         }
 
@@ -430,10 +471,15 @@ export default class EditorController extends Controller {
         // new publishing flow sets the post status manually on publish
         this.set('post.status', status);
 
+        const explicitSave = !options.backgroundSave;
+        const leavingEditor = options.leavingEditor;
+        if (explicitSave || leavingEditor) {
+            adapterOptions.saveRevision = 1;
+        }
         yield this.beforeSaveTask.perform(options);
 
         try {
-            let post = yield this._savePostTask.perform(options);
+            let post = yield this._savePostTask.perform({...options, adapterOptions});
 
             post.set('statusScratch', null);
 
@@ -451,6 +497,9 @@ export default class EditorController extends Controller {
                 }
                 return true;
             }
+
+            // Even if we've just saved and nothing else has changed, we want to save in 10 minutes to force a revision
+            this._revisionSaveTask.perform();
 
             return post;
         } catch (error) {
@@ -498,10 +547,11 @@ export default class EditorController extends Controller {
     *beforeSaveTask(options = {}) {
         // ensure we remove any blank cards when performing a full save
         if (!options.backgroundSave) {
-            if (this._koenig) {
-                this._koenig.cleanup();
-                this.set('hasDirtyAttributes', true);
-            }
+            // TODO: not yet implemented in react editor
+            // if (this._koenig) {
+            //     this._koenig.cleanup();
+            //     this.set('hasDirtyAttributes', true);
+            // }
         }
 
         // TODO: There's no need for (at least) most of these scratch values.
@@ -509,10 +559,10 @@ export default class EditorController extends Controller {
 
         // Set the properties that are indirected
 
-        // Set mobiledoc equal to what's in the editor but create a copy so that
+        // Set lexical equal to what's in the editor but create a copy so that
         // nested objects/arrays don't keep references which can mean that both
-        // scratch and mobiledoc get updated simultaneously
-        this.set('post.mobiledoc', JSON.parse(JSON.stringify(this.post.scratch || null)));
+        // scratch and lexical get updated simultaneously
+        this.set('post.lexical', this.post.lexicalScratch || null);
 
         // Set a default title
         if (!this.get('post.titleScratch').trim()) {
@@ -634,10 +684,10 @@ export default class EditorController extends Controller {
 
             // log if a save is slow
             if (this.config.sentry_dsn && (Date.now() - startTime > 2000)) {
-                captureMessage('Successful Mobiledoc save took > 2s', (scope) => {
+                captureMessage('Successful Lexical save took > 2s', (scope) => {
                     scope.setTag('save_time', Math.ceil((Date.now() - startTime) / 1000));
                     scope.setTag('post_type', post.isPage ? 'page' : 'post');
-                    scope.setTag('newsletter', options.adapterOptions?.newsletter);
+                    scope.setTag('save_revision', options.adapterOptions?.saveRevision);
                     scope.setTag('email_segment', options.adapterOptions?.emailSegment);
                     scope.setTag('save_revision', options.adapterOptions?.saveRevision);
                     scope.setTag('convert_to_lexical', options.adapterOptions?.convertToLexical);
@@ -683,17 +733,17 @@ export default class EditorController extends Controller {
         post.updateTags();
         this._previousTagNames = this._tagNames;
 
-        // update the scratch property if it's `null` and we get a blank mobiledoc
+        // update the scratch property if it's `null` and we get a blank lexical
         // back from the API - prevents "unsaved changes" modal on new+blank posts
-        if (!post.scratch) {
-            post.set('scratch', JSON.parse(JSON.stringify(post.get('mobiledoc'))));
+        if (!post.lexicalScratch) {
+            post.set('lexicalScratch', post.get('lexical'));
         }
 
         // if the two "scratch" properties (title and content) match the post,
         // then it's ok to set hasDirtyAttributes to false
         // TODO: why is this necessary?
         let titlesMatch = post.get('titleScratch') === post.get('title');
-        let bodiesMatch = JSON.stringify(post.get('scratch')) === JSON.stringify(post.get('mobiledoc'));
+        let bodiesMatch = post.get('lexicalScratch') === post.get('lexical');
 
         if (titlesMatch && bodiesMatch) {
             this.set('hasDirtyAttributes', false);
@@ -757,10 +807,76 @@ export default class EditorController extends Controller {
         }
     }
 
-    // load supplementel data such as the members count in the background
+    // load supplemental data such as snippets and collections in the background
     @restartableTask
     *backgroundLoaderTask() {
         yield this.store.query('snippet', {limit: 'all'});
+        if (this.post.displayName === 'page' && this.feature.get('collections') && this.feature.get('collectionsCard')) {
+            yield this.store.query('collection', {limit: 'all'});
+        }
+        this.syncMobiledocSnippets();
+    }
+
+    @action
+    async syncMobiledocSnippets() {
+        const snippets = this.store.peekAll('snippet');
+
+        // very early in the beta we had a bug where lexical snippets were saved with double-encoded JSON
+        // we fix that here by re-saving any snippets that are still in that state
+        const snippetFixSaves = [];
+        snippets.forEach((snippet) => {
+            if (typeof snippet.lexical === 'string') {
+                try {
+                    snippet.lexical = JSON.parse(snippet.lexical);
+                    snippet.mobiledoc = {};
+                    snippetFixSaves.push(snippet.save());
+                } catch (e) {
+                    snippet.lexical = null;
+                    snippetFixSaves.push(snippet.save());
+
+                    console.error(e); // eslint-disable-line no-console
+
+                    if (this.config.sentry_dsn) {
+                        Sentry.captureException(e, {
+                            tags: {
+                                lexical: true
+                            }
+                        });
+                    }
+                }
+            }
+        });
+        await Promise.all(snippetFixSaves);
+
+        snippets.forEach((snippet) => {
+            if (!snippet.lexical || snippet.lexical.syncedAt && moment.utc(snippet.lexical.syncedAt).isBefore(snippet.updatedAtUTC)) {
+                const serializedLexical = mobiledocToLexical(JSON.stringify(snippet.mobiledoc));
+
+                // we get a full Lexical doc from the converter but Lexical only
+                // stores an array of nodes in it's copy/paste dataset that we use for snippets
+                const lexical = JSON.parse(serializedLexical);
+                let nodes = lexical.root.children;
+
+                // for a single-paragraph text selection Lexical only stores the
+                // text children in the nodes array
+                if (nodes.length === 1 && nodes[0].type === 'paragraph') {
+                    nodes = nodes[0].children;
+                }
+
+                const lexicalData = {
+                    namespace: 'KoenigEditor',
+                    nodes
+                };
+
+                // set syncedAt so we can check if mobiledoc has been updated in next sync
+                lexicalData.syncedAt = moment.utc().toISOString();
+
+                snippet.lexical = lexicalData;
+
+                // kick off a background save, we already have .lexical updated which is what we need
+                snippet.save();
+            }
+        });
     }
 
     /* Public methods --------------------------------------------------------*/
@@ -786,7 +902,7 @@ export default class EditorController extends Controller {
         // edit of the post
         // TODO: can these be `boundOneWay` on the model as per the other attrs?
         post.set('titleScratch', post.get('title'));
-        post.set('scratch', post.get('mobiledoc'));
+        post.set('lexicalScratch', post.get('lexical'));
 
         this._previousTagNames = this._tagNames;
 
@@ -815,12 +931,19 @@ export default class EditorController extends Controller {
             return;
         }
 
-        // clean up blank cards when leaving the editor if we have a draft post
-        // - blank cards could be left around due to autosave triggering whilst
-        //   a blank card is present then the user attempting to leave
-        // - will mark the post as dirty so it gets saved when transitioning
-        if (this._koenig && post.isDraft) {
-            this._koenig.cleanup();
+        // wait for any save to finish before continuing to avoid any issues
+        // with attempting a new save whilst another has requests in-flight
+        if (this.saveTask.isRunning) {
+            transition.abort();
+            await this.saveTask.last;
+            return transition.retry();
+        }
+        // extra handling for PSM-triggered save tasks that aren't captured above
+        // NOTE: we don't wait on `_savePostTask` as it's only used as a child task
+        if (this.savePostTask.isRunning) {
+            transition.abort();
+            await this.savePostTask.last;
+            return transition.retry();
         }
 
         // user can enter the slug name and then leave the post page,
@@ -831,8 +954,22 @@ export default class EditorController extends Controller {
             return transition.retry();
         }
 
+        // clean up blank cards when leaving the editor if we have a draft post
+        // - blank cards could be left around due to autosave triggering whilst
+        //   a blank card is present then the user attempting to leave
+        // - will mark the post as dirty so it gets saved when transitioning
+        // TODO: not yet implemented in lexical editor
+        // if (this._koenig && post.isDraft) {
+        //     this._koenig.cleanup();
+        // }
+
         let hasDirtyAttributes = this.hasDirtyAttributes;
         let state = post.getProperties('isDeleted', 'isSaving', 'hasDirtyAttributes', 'isNew');
+
+        // Check if anything has changed since the last revision
+        let postRevisions = post.get('postRevisions').toArray();
+        let latestRevision = postRevisions[postRevisions.length - 1];
+        let hasChangedSinceLastRevision = !post.isNew && post.lexical.replaceAll(this.config.blogUrl, '') !== latestRevision.lexical.replaceAll(this.config.blogUrl, '');
 
         let fromNewToEdit = this.router.currentRouteName === 'editor.new'
             && transition.targetName === 'editor.edit'
@@ -842,6 +979,17 @@ export default class EditorController extends Controller {
 
         let deletedWithoutChanges = state.isDeleted
             && (state.isSaving || !state.hasDirtyAttributes);
+
+        // If leaving the editor and the post has changed since we last saved a revision, always save a new revision
+        if (hasChangedSinceLastRevision) {
+            transition.abort();
+            if (this._autosaveRunning) {
+                this.cancelAutosave();
+                this.autosaveTask.cancelAll();
+            }
+            await this.autosaveTask.perform({leavingEditor: true, backgroundSave: false});
+            return transition.retry();
+        }
 
         // controller is dirty and we aren't in a new->edit or delete->index
         // transition so show our "are you sure you want to leave?" modal
@@ -859,7 +1007,8 @@ export default class EditorController extends Controller {
                 this.cancelAutosave();
                 this.autosaveTask.cancelAll();
 
-                await this.autosaveTask.perform();
+                // If leaving the editor, always save a revision
+                await this.autosaveTask.perform({leavingEditor: true});
                 return transition.retry();
             }
 
@@ -875,7 +1024,7 @@ export default class EditorController extends Controller {
                 return;
             } else {
                 this._leaveConfirmed = true;
-                transition.retry();
+                return transition.retry();
             }
         }
 
@@ -952,6 +1101,21 @@ export default class EditorController extends Controller {
     }).drop())
         _timedSaveTask;
 
+    // save at 10 minutes even if the post is already saved
+    @(task(function* () {
+        if (!this._canAutosave) {
+            return;
+        }
+
+        while (config.environment !== 'test' && true) {
+            yield timeout(REVISIONSAVE_TIMEOUT);
+            this.autosaveTask.perform({
+                saveRevision: this._canAutosave
+            });
+        }
+    }).drop())
+        _revisionSaveTask;
+
     /* Private methods -------------------------------------------------------*/
 
     _hasDirtyAttributes() {
@@ -984,15 +1148,12 @@ export default class EditorController extends Controller {
         }
 
         // scratch isn't an attr so needs a manual dirty check
-        let mobiledoc = post.get('mobiledoc');
-        let scratch = post.get('scratch');
+        let lexical = post.get('lexical');
+        let scratch = post.get('lexicalScratch');
         // additional guard in case we are trying to compare null with undefined
-        if (scratch || mobiledoc) {
-            let mobiledocJSON = JSON.stringify(mobiledoc);
-            let scratchJSON = JSON.stringify(scratch);
-
-            if (scratchJSON !== mobiledocJSON) {
-                this._leaveModalReason = {reason: 'mobiledoc is different', context: {current: mobiledocJSON, scratch: scratchJSON}};
+        if (scratch || lexical) {
+            if (scratch !== lexical) {
+                this._leaveModalReason = {reason: 'lexical is different', context: {current: lexical, scratch}};
                 return true;
             }
         }
