@@ -19,6 +19,7 @@ interface ServicesContextProps {
     search: SearchService;
     unsplashConfig: DefaultHeaderTypes;
     sentryDSN: string | null;
+    fetchKoenigLexical: any;
     onUpdate: (dataType: string, response: unknown) => void;
     onInvalidate: (dataType: string) => void;
     onDelete: (dataType: string, id: string) => void;
@@ -31,6 +32,7 @@ interface ServicesProviderProps {
     officialThemes: OfficialTheme[];
     unsplashConfig: DefaultHeaderTypes;
     sentryDSN: string | null;
+    fetchKoenigLexical: any;
     onUpdate: (dataType: string, response: unknown) => void;
     onInvalidate: (dataType: string) => void;
     onDelete: (dataType: string, id: string) => void;
@@ -49,17 +51,19 @@ const ServicesContext = createContext<ServicesContextProps>({
         'X-Unsplash-Cache': true
     },
     sentryDSN: null,
+    fetchKoenigLexical: () => {},
     onUpdate: () => {},
     onInvalidate: () => {},
     onDelete: () => {}
 });
 
-const ServicesProvider: React.FC<ServicesProviderProps> = ({children, ghostVersion, zapierTemplates, officialThemes, unsplashConfig, sentryDSN, onUpdate, onInvalidate, onDelete}) => {
+const ServicesProvider: React.FC<ServicesProviderProps> = ({children, ghostVersion, zapierTemplates, officialThemes, fetchKoenigLexical, unsplashConfig, sentryDSN, onUpdate, onInvalidate, onDelete}) => {
     const search = useSearchService();
 
     return (
         <ServicesContext.Provider value={{
             ghostVersion,
+            fetchKoenigLexical,
             officialThemes,
             zapierTemplates,
             search,

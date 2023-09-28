@@ -20,6 +20,7 @@ interface AppProps {
     darkMode?: boolean;
     unsplashConfig: DefaultHeaderTypes
     sentryDSN: string | null;
+    fetchKoenigLexical: any;
     onUpdate: (dataType: string, response: unknown) => void;
     onInvalidate: (dataType: string) => void;
     onDelete: (dataType: string, id: string) => void;
@@ -37,7 +38,7 @@ const queryClient = new QueryClient({
     }
 });
 
-function App({ghostVersion, officialThemes, zapierTemplates, externalNavigate, darkMode = false, unsplashConfig, sentryDSN, onUpdate, onInvalidate, onDelete}: AppProps) {
+function App({ghostVersion, officialThemes, zapierTemplates, externalNavigate, darkMode = false, unsplashConfig, fetchKoenigLexical, sentryDSN, onUpdate, onInvalidate, onDelete}: AppProps) {
     const appClassName = clsx(
         'admin-x-settings h-[100vh] w-full overflow-y-auto overflow-x-hidden',
         darkMode && 'dark'
@@ -46,7 +47,7 @@ function App({ghostVersion, officialThemes, zapierTemplates, externalNavigate, d
     return (
         <SentryErrorBoundary>
             <QueryClientProvider client={queryClient}>
-                <ServicesProvider ghostVersion={ghostVersion} officialThemes={officialThemes} sentryDSN={sentryDSN} unsplashConfig={unsplashConfig} zapierTemplates={zapierTemplates} onDelete={onDelete} onInvalidate={onInvalidate} onUpdate={onUpdate}>
+                <ServicesProvider fetchKoenigLexical={fetchKoenigLexical} ghostVersion={ghostVersion} officialThemes={officialThemes} sentryDSN={sentryDSN} unsplashConfig={unsplashConfig} zapierTemplates={zapierTemplates} onDelete={onDelete} onInvalidate={onInvalidate} onUpdate={onUpdate}>
                     <GlobalDataProvider>
                         <RoutingProvider externalNavigate={externalNavigate}>
                             <GlobalDirtyStateProvider>
